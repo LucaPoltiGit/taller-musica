@@ -1,16 +1,25 @@
 package com.tallermusica.loopera.audio
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioRecord
 import android.media.AudioTimestamp
 import android.media.AudioTrack
+import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.AudioEffect
+import android.media.audiofx.AutomaticGainControl
+import android.media.audiofx.NoiseSuppressor
 import android.os.Process
 import android.os.SystemClock
 import android.util.Log
 import com.tallermusica.loopera.core.BeatPosition
+import com.tallermusica.loopera.core.CaptureBuffer
 import com.tallermusica.loopera.core.LoopMath
+import kotlin.math.abs
 import kotlin.math.max
 
 /**
@@ -21,6 +30,9 @@ import kotlin.math.max
  * N del contador es el N-ésimo frame escrito, así que con AudioTrack.getTimestamp se sabe qué
  * frame está sonando en cada instante. La posición del loop es siempre
  * (frame - inicioDelPulso) % largoDelLoop; no hay timers de UI.
+ *
+ * El micrófono graba de forma continua en un [CaptureBuffer] donde cada bloque queda marcado
+ * con el frame de salida que se estaba escuchando cuando se captó.
  */
 class LoopEngine(context: Context) {
 
@@ -131,6 +143,10 @@ class LoopEngine(context: Context) {
 
     /** Latencia de salida estimada a partir del tamaño del buffer (se usa si no hay timestamp). */
     @Volatile var outputLatencyFrames: Int = 0
+        private set
+
+    /** Latencia de entrada estimada (tamaño del buffer del micrófono). */
+    @Volatile var inputLatencyFrames: Int = 0
         private set
 
     val outputUsesTimestamp: Boolean get() = anchor.fromTimestamp
@@ -294,12 +310,219 @@ class LoopEngine(context: Context) {
         return LoopMath.beatPosition(heard - ts, bpm, bars, sampleRate)
     }
 
+    // ---------------------------------------------------------------- Micrófono
+
+    private var record: AudioRecord? = null
+    private var inputThread: Thread? = null
+    @Volatile private var inputRunning = false
+    private val effects = mutableListOf<AudioEffect>()
+
+    /** Unos 43 s de audio: alcanza para más de una vuelta del loop más largo (4 compases a 40). */
+    private val capture = CaptureBuffer(capacityFrames = 1 shl 21)
+
+    /** Pico reciente del micrófono (0..1), para el medidor. */
+    @Volatile var inputLevel: Float = 0f
+        private set
+
+    val isMicActive: Boolean get() = inputRunning
+
+    /** Fuente de audio que se terminó usando, para mostrar. */
+    @Volatile var inputSourceName: String = ""
+        private set
+
+    /** Requiere el permiso RECORD_AUDIO concedido. Devuelve false si no se pudo abrir. */
+    @SuppressLint("MissingPermission")
+    @Synchronized
+    fun startMic(): Boolean {
+        if (inputRunning) return true
+        val minBytes = AudioRecord.getMinBufferSize(
+            sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_FLOAT,
+        )
+        if (minBytes <= 0) return false
+        val bufferBytes = max(minBytes * 2, blockFrames * 4 * 4)
+
+        val unprocessed = audioManager
+            .getProperty(AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED)
+            ?.toBoolean() == true
+        val sources = buildList {
+            if (unprocessed) add(MediaRecorder.AudioSource.UNPROCESSED to "sin procesar")
+            add(MediaRecorder.AudioSource.VOICE_RECOGNITION to "reconocimiento de voz")
+            add(MediaRecorder.AudioSource.MIC to "micrófono")
+        }
+        var rec: AudioRecord? = null
+        for ((source, name) in sources) {
+            val r = try {
+                AudioRecord(source, sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_FLOAT, bufferBytes)
+            } catch (e: Exception) {
+                Log.w(TAG, "No se pudo abrir la fuente $name", e)
+                null
+            }
+            if (r != null && r.state == AudioRecord.STATE_INITIALIZED) {
+                rec = r
+                inputSourceName = name
+                break
+            }
+            r?.release()
+        }
+        if (rec == null) return false
+
+        disableEffects(rec.audioSessionId)
+        inputLatencyFrames = bufferBytes / 4 / 2
+        capture.clear()
+        try {
+            rec.startRecording()
+        } catch (e: IllegalStateException) {
+            Log.e(TAG, "No se pudo empezar a grabar", e)
+            rec.release()
+            releaseEffects()
+            return false
+        }
+        record = rec
+        inputRunning = true
+        inputThread = Thread({ inputLoop(rec) }, "loopera-entrada").also { it.start() }
+        return true
+    }
+
+    private fun disableEffects(session: Int) {
+        try {
+            if (AutomaticGainControl.isAvailable()) {
+                AutomaticGainControl.create(session)?.let { it.enabled = false; effects += it }
+            }
+            if (NoiseSuppressor.isAvailable()) {
+                NoiseSuppressor.create(session)?.let { it.enabled = false; effects += it }
+            }
+            if (AcousticEchoCanceler.isAvailable()) {
+                AcousticEchoCanceler.create(session)?.let { it.enabled = false; effects += it }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "No se pudieron desactivar los efectos de entrada", e)
+        }
+    }
+
+    private fun releaseEffects() {
+        effects.forEach { runCatching { it.release() } }
+        effects.clear()
+    }
+
+    @Synchronized
+    fun stopMic() {
+        if (!inputRunning) return
+        inputRunning = false
+        inputThread?.join(500)
+        inputThread = null
+        record?.let {
+            runCatching { it.stop() }
+            it.release()
+        }
+        record = null
+        releaseEffects()
+        inputLevel = 0f
+    }
+
+    private fun inputLoop(rec: AudioRecord) {
+        Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+        val chunk = FloatArray(blockFrames)
+        val ts = AudioTimestamp()
+        var inputFrames = 0L
+        var level = 0f
+        while (inputRunning) {
+            val n = rec.read(chunk, 0, chunk.size, AudioRecord.READ_BLOCKING)
+            if (n <= 0) {
+                if (n < 0) Log.e(TAG, "Error al leer el micrófono: $n")
+                SystemClock.sleep(2)
+                continue
+            }
+            val first = inputFrames
+            inputFrames += n
+            val now = System.nanoTime()
+            // Instante en que se captó la primera muestra del bloque.
+            val captureNanos =
+                if (rec.getTimestamp(ts, AudioTimestamp.TIMEBASE_MONOTONIC) == AudioRecord.SUCCESS) {
+                    ts.nanoTime + (first - ts.framePosition) * 1_000_000_000L / sampleRate
+                } else {
+                    now - (n + inputLatencyFrames).toLong() * 1_000_000_000L / sampleRate
+                }
+            // Lo que el músico escuchaba en ese instante es el frame de salida del bloque.
+            capture.write(chunk, n, heardFrameAt(captureNanos))
+
+            var peak = 0f
+            for (i in 0 until n) {
+                val a = abs(chunk[i])
+                if (a > peak) peak = a
+            }
+            level = if (peak > level) peak else level * 0.85f
+            inputLevel = level.coerceIn(0f, 1f)
+        }
+    }
+
+    // ---------------------------------------------------------------- Grabación de capas
+
+    class CaptureToken internal constructor(
+        val pressFrame: Long,
+        val startedTransport: Boolean,
+        val transportStart: Long,
+    )
+
+    sealed interface CaptureResult {
+        class Layer(val samples: FloatArray) : CaptureResult
+        data object TooShort : CaptureResult
+        data object Silent : CaptureResult
+        data object Failed : CaptureResult
+    }
+
+    /** Al apretar GRABAR. Si el pulso estaba parado, lo arranca en el compás 1. */
+    fun beginCapture(): CaptureToken {
+        val started = !isPlaying
+        val ts = startTransport()
+        val press = if (started) ts else heardFrameNow()
+        return CaptureToken(press, started, ts)
+    }
+
+    /**
+     * Al soltar GRABAR. Bloquea un momento (hasta que llegan las últimas muestras del
+     * micrófono), así que hay que llamarlo fuera del hilo principal.
+     *
+     * @param manualAdjustFrames ajuste de sincronía extra: corre la capa hacia atrás.
+     */
+    fun finishCapture(token: CaptureToken, manualAdjustFrames: Int): CaptureResult {
+        val release = heardFrameNow()
+        if (release - token.pressFrame < sampleRate / 10) return CaptureResult.TooShort
+
+        // Esperar a que el micrófono haya entregado todo lo tocado hasta el momento de soltar.
+        val deadline = SystemClock.uptimeMillis() + 800
+        while ((capture.latestOutFrame() ?: Long.MIN_VALUE) < release &&
+            SystemClock.uptimeMillis() < deadline && inputRunning
+        ) {
+            SystemClock.sleep(5)
+        }
+
+        val preroll = sampleRate * PREROLL_MS / 1000
+        val from = if (token.startedTransport) token.transportStart else token.pressFrame - preroll
+        val extracted = capture.extract(from, release) ?: return CaptureResult.Failed
+        if (extracted.samples.size < sampleRate / 10) return CaptureResult.TooShort
+        if (LoopMath.isSilent(extracted.samples)) return CaptureResult.Silent
+
+        // Los timestamps ya descuentan la latencia de entrada y salida medida; el ajuste
+        // manual corrige lo que el equipo no informa bien.
+        val startInLoop = extracted.firstOutFrame - token.transportStart - manualAdjustFrames
+        val layer = LoopMath.placeRecording(
+            recording = extracted.samples,
+            startFrame = startInLoop,
+            loopFrames = loopFrames,
+            fadeFrames = sampleRate * FADE_EDGES_MS / 1000,
+        )
+        return CaptureResult.Layer(layer)
+    }
+
     fun release() {
+        stopMic()
         stopOutput()
     }
 
     companion object {
         private const val TAG = "LoopEngine"
         private const val FADE_MS = 10
+        private const val FADE_EDGES_MS = 6
+        private const val PREROLL_MS = 40
     }
 }

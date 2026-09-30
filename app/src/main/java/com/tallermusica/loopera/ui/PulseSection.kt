@@ -34,7 +34,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -94,17 +93,8 @@ private fun PulseCircle(clock: State<ClockSnapshot>, modifier: Modifier) {
             val g = glow(beat)
             val accent = accentFor(beat)
             val maxR = size.minDimension / 2f
-            if (beat != null) {
-                // Halo que se expande con el golpe
-                drawCircle(accent.copy(alpha = 0.28f * g), radius = maxR)
-            }
             val color = if (beat == null) rest else lerp(lerp(rest, accent, 0.35f), accent, g)
             drawCircle(color, radius = maxR * (0.80f + 0.16f * g))
-            drawCircle(
-                color = accent.copy(alpha = if (beat == null) 0.25f else 0.9f),
-                radius = maxR * (0.80f + 0.16f * g),
-                style = Stroke(width = 3.dp.toPx()),
-            )
         }
         val beat = clock.value.beat
         Text(
@@ -138,7 +128,7 @@ private fun BeatDots(clock: State<ClockSnapshot>, modifier: Modifier) {
                 val accent = if (i == 0) DownbeatRed else BeatCeleste
                 val radius = if (i == 0) r else r * 0.8f
                 if (current) {
-                    drawCircle(accent, radius = radius * (1f + 0.25f * glow(beat)), center = center)
+                    drawCircle(accent, radius = radius, center = center)
                 } else {
                     drawCircle(if (i == 0) lerp(off, DownbeatRed, 0.3f) else off, radius = radius * 0.85f, center = center)
                 }
