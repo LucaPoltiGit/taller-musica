@@ -138,6 +138,7 @@ fun LooperScreen(vm: LooperViewModel) {
                     onEnabledChange = { vm.setLayerEnabled(layer.id, it) },
                     onVolumeChange = { vm.setLayerVolume(layer.id, it) },
                     onDelete = { vm.deleteLayer(layer.id) },
+                    modifier = Modifier.animateItem(),
                 )
             }
         }

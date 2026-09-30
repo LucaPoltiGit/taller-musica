@@ -1,6 +1,8 @@
 package com.tallermusica.loopera.ui
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -41,6 +43,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
@@ -128,14 +131,19 @@ fun RecordButton(
 ) {
     val press by rememberUpdatedState(onPress)
     val release by rememberUpdatedState(onRelease)
-    val container = when {
-        recording -> Color(0xFFD32F2F)
-        enabled -> Color(0xFFE53935)
-        else -> Color(0xFFE53935).copy(alpha = 0.45f)
-    }
+    val container by animateColorAsState(
+        when {
+            recording -> Color(0xFFD32F2F)
+            enabled -> Color(0xFFE53935)
+            else -> Color(0xFFE53935).copy(alpha = 0.45f)
+        },
+        label = "grabar-color",
+    )
+    val scale by animateFloatAsState(if (recording) 1.08f else 1f, label = "grabar-escala")
     Box(
         modifier = modifier
             .size(148.dp)
+            .scale(scale)
             .clip(CircleShape)
             .background(container)
             .border(
@@ -261,6 +269,13 @@ fun SyncAdjustSection(
                 TextButton(onClick = { onChange(0) }, enabled = state.syncAdjustMs != 0) {
                     Text("Volver a 0")
                 }
+                val medido = if (state.usesTimestamps) "medida con marcas de tiempo del sistema" else "estimada por el tamaño de los buffers"
+                Text(
+                    "Latencia de salida: ${state.outputLatencyMs} ms ($medido)" +
+                        (if (state.inputSource.isNotEmpty()) " · entrada: ${state.inputSource}" else ""),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
     }
